@@ -1,15 +1,15 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Union
 
 import torch
 
 
-# Tuple order: (A_dtype, W_dtype, accum_dtype, out_dtype).
+# Tuple order: (A_dtype, W_dtype, accum_dtype, out_dtype, requires_dequant).
 SUPPORTED_DTYPE_COMBINATIONS = [
-    ("float32", "float32", "float32", "float32"),
-    ("float16", "float16", "float32", "float32"),
-    ("float16", "float32", "float32", "float32"),
-    ("float32", "float16", "float32", "float32"),
+    ("float32", "float32", "float32", "float32", False),
+    ("float16", "float16", "float32", "float32", False),
+    ("float16", "float32", "float32", "float32", False),
+    ("float32", "float16", "float32", "float32", False),
 ]
 
 
@@ -22,11 +22,13 @@ class MatmulConfig:
     W_dtype:     Union[str, torch.dtype] = "float32"
     accum_dtype: Union[str, torch.dtype] = "float32"
     out_dtype:   Union[str, torch.dtype] = "float32"
+    # Derived from the supported combination, not from device capabilities.
+    requires_dequant: bool = field(init=False)
     # A scheduler may select the tile in a later stage.
     tile: tuple = (8, 8, 8)
 
     def __post_init__(self):
-        """Validate dimensions and normalize dtype fields to strings."""
+        """Validate dimensions, normalize dtypes, and derive the dequant flag."""
         if not isinstance(self.tile, tuple):
             raise TypeError(
                 f"tile must be a tuple; got {type(self.tile).__name__}."
@@ -63,9 +65,14 @@ class MatmulConfig:
             object.__setattr__(self, name, value)
 
         dtype_combination = tuple(getattr(self, name) for name in dtype_fields)
-        if dtype_combination not in SUPPORTED_DTYPE_COMBINATIONS:
+        for combination in SUPPORTED_DTYPE_COMBINATIONS:
+            if dtype_combination == combination[:4]:
+                object.__setattr__(self, "requires_dequant", combination[4])
+                break
+        else:
+            supported_dtypes = [entry[:4] for entry in SUPPORTED_DTYPE_COMBINATIONS]
             raise NotImplementedError(
                 f"Unsupported dtype combination {dtype_combination!r} "
                 "in (A_dtype, W_dtype, accum_dtype, out_dtype) order. "
-                f"Supported combinations: {SUPPORTED_DTYPE_COMBINATIONS!r}."
+                f"Supported combinations: {supported_dtypes!r}."
             )
