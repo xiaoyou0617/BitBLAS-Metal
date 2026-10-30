@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toyblas"
+version = "0.1.0"
+dependencies = [
+    "torch>=2.8.0", 
+    "tilelang>=0.1.9"
+]
