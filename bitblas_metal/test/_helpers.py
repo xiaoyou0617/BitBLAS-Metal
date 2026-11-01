@@ -5,15 +5,15 @@ import unittest
 
 import torch
 
-from toyblas import Matmul, MatmulConfig
-from toyblas.operations.config import SUPPORTED_DTYPE_COMBINATIONS
-from toyblas.operations.pack import pack_int4
-from toyblas.operations.quantize import quantize_int4, quantize_int4_with_grouping
+from bitblas_metal import Matmul, MatmulConfig
+from bitblas_metal.operations.config import SUPPORTED_DTYPE_COMBINATIONS
+from bitblas_metal.operations.pack import pack_int4
+from bitblas_metal.operations.quantize import quantize_int4, quantize_int4_with_grouping
 
 
 def on_device(device):
     """Class decorator: explicitly report excluded or unavailable devices as skips."""
-    selected = os.environ.get("TOYBLAS_TEST_DEVICE", "all")
+    selected = os.environ.get("BITBLAS_METAL_TEST_DEVICE", "all")
     if selected not in ("all", device):
         return unittest.skip(f"device={selected} excludes {device}")
     if device == "mps" and not torch.backends.mps.is_available():

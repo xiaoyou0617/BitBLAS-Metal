@@ -1,11 +1,28 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "toyblas"
+name = "bitblas-metal"
 version = "0.1.0"
+description = "Experimental low-precision matrix multiplication for Apple Silicon with TileLang"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [{name = "xiaoyou0617"}]
+keywords = ["metal", "apple-silicon", "matmul", "quantization", "tilelang"]
 dependencies = [
-    "torch>=2.8.0", 
+    "torch>=2.8.0",
     "tilelang>=0.1.9"
 ]
+
+[project.urls]
+Repository = "https://github.com/xiaoyou0617/BitBLAS"
+"Inspired by BitBLAS" = "https://github.com/tile-ai/BitBLAS"
+
+[tool.setuptools.packages.find]
+include = ["bitblas_metal", "bitblas_metal.*"]
+
+[tool.setuptools.package-data]
+bitblas_metal = ["test/run.sh"]

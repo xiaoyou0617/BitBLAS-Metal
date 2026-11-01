@@ -15,7 +15,7 @@ def main():
     parser.add_argument("--color", choices=("auto", "always", "never"), default="auto",
                         help="auto: color terminal output; always: force colors; never: plain text")
     args = parser.parse_args()
-    os.environ["TOYBLAS_TEST_DEVICE"] = args.device
+    os.environ["BITBLAS_METAL_TEST_DEVICE"] = args.device
     # Exercise current kernel generation rather than an older disk-cache entry.
     os.environ["TILELANG_DISABLE_CACHE"] = "1"
 

@@ -2,8 +2,8 @@ import unittest
 
 import torch
 
-from toyblas import MatmulConfig
-from toyblas.operations.config import SUPPORTED_DTYPE_COMBINATIONS
+from bitblas_metal import MatmulConfig
+from bitblas_metal.operations.config import SUPPORTED_DTYPE_COMBINATIONS
 
 
 class TestMatmulConfig(unittest.TestCase):

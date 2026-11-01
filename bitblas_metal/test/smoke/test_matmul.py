@@ -2,9 +2,9 @@ import unittest
 
 import torch
 
-from toyblas import Matmul, MatmulConfig
-from toyblas.operations.pack import pack_int4
-from toyblas.test._helpers import check_matmul, config_label, configs_for, noncontiguous_copy, on_device
+from bitblas_metal import Matmul, MatmulConfig
+from bitblas_metal.operations.pack import pack_int4
+from bitblas_metal.test._helpers import check_matmul, config_label, configs_for, noncontiguous_copy, on_device
 
 
 class MatmulSmokeChecks:

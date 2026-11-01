@@ -1,0 +1,20 @@
+# Python environments, bytecode, and packaging artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Local caches and compiler/debug output
+.cache/
+.pytest_cache/
+.tilelang/
+tmp/
+
+# macOS metadata and local environment settings
+.DS_Store
+.env
+.env.*
+!.env.example

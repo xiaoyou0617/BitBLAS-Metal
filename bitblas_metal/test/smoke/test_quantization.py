@@ -2,9 +2,9 @@ import unittest
 
 import torch
 
-from toyblas.operations.pack import pack_int4, unpack_int4
-from toyblas.operations.quantize import quantize_int4, quantize_int4_with_grouping
-from toyblas.test._helpers import noncontiguous_copy, on_device
+from bitblas_metal.operations.pack import pack_int4, unpack_int4
+from bitblas_metal.operations.quantize import quantize_int4, quantize_int4_with_grouping
+from bitblas_metal.test._helpers import noncontiguous_copy, on_device
 
 
 class QuantizationChecks:

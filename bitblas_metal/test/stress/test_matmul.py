@@ -1,6 +1,6 @@
 import unittest
 
-from toyblas.test._helpers import check_matmul, config_label, configs_for, on_device
+from bitblas_metal.test._helpers import check_matmul, config_label, configs_for, on_device
 
 
 class MatmulStressChecks:

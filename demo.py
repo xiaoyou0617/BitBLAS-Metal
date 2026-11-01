@@ -2,7 +2,7 @@
 
 import torch
 
-from toyblas import (
+from bitblas_metal import (
     Matmul,
     MatmulConfig,
     pack_int4,
