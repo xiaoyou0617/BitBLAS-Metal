@@ -13,6 +13,11 @@ SUPPORTED_DTYPE_COMBINATIONS = [
     ("float16", "float32", "float32", "float32", False),
     ("float32", "float16", "float32", "float32", False),
     ("float16", "int4", "float32", "float32", True),
+    ("float32", "float32", "float32", "float16", False),
+    ("float16", "float16", "float32", "float16", False),
+    ("float16", "float32", "float32", "float16", False),
+    ("float32", "float16", "float32", "float16", False),
+    ("float16", "int4", "float32", "float16", True),
 ]
 
 

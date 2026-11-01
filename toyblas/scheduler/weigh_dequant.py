@@ -3,11 +3,12 @@ from .base import MatmulKernel, MatmulScheduler
 
 
 class WeightDequantMatmulScheduler(MatmulScheduler):
-    """Build FP16 x packed signed INT4 -> FP32, optionally scaling each column.
+    """Build FP16 x packed signed INT4 with FP32 accumulation and optional scaling.
 
     Integer codes in [-8, 7] are decoded during tile loads. With scaling,
     C[m, n] = sum_k(A[m, k] * qW[k, n]) * scales[n].
     Positive group_size selects scales[ceil(K / group_size), N].
+    Output is converted to FP16 or FP32 only after accumulation and scaling.
     Zero points are not part of this implementation.
     """
 
@@ -18,11 +19,12 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
         combination = (
             config.A_dtype, config.W_dtype, config.accum_dtype, config.out_dtype
         )
-        if combination != ("float16", "int4", "float32", "float32"):
+        if (combination[:3] != ("float16", "int4", "float32")
+                or config.out_dtype not in ("float16", "float32")):
             raise NotImplementedError(
                 "WeightDequantMatmulScheduler requires "
                 "(A_dtype, W_dtype, accum_dtype, out_dtype) = "
-                "('float16', 'int4', 'float32', 'float32')."
+                "('float16', 'int4', 'float32', 'float16' or 'float32')."
             )
         self.tile = config.tile
         self.threads = 64
@@ -85,7 +87,7 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                             tile_W[k, high_col] = 0.0
 
             @T.macro
-            def matmul_tile(A, B, C, bx, by):
+            def matmul_tile(A, B, tile_Out, bx, by):
                 tile_A = T.alloc_shared(
                     (block_M, block_K), config.A_dtype, scope="shared"
                 )
@@ -95,10 +97,7 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                 )
 
                 for i, j in T.Parallel(block_M, block_N):
-                    x_idx = bx * block_M + i
-                    y_idx = by * block_N + j
-                    if x_idx < M and y_idx < N:
-                        C[x_idx, y_idx] = 0.0
+                    tile_Out[i, j] = 0.0
 
                 for bz in range(T.ceildiv(K, block_K)):
                     load_tiles(A, B, tile_A, tile_W, bx, by, bz)
@@ -113,10 +112,7 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                                 T.cast(tile_A[i, k], config.accum_dtype)
                                 * T.cast(tile_W[k, j], config.accum_dtype)
                             )
-                        x_idx = bx * block_M + i
-                        y_idx = by * block_N + j
-                        if x_idx < M and y_idx < N:
-                            C[x_idx, y_idx] += acc[0]
+                        tile_Out[i, j] += acc[0]
                     # Finish all reads before the next K tile overwrites shared memory.
                     T.sync_threads()
 
@@ -141,12 +137,12 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                         tile_W = T.alloc_shared(
                             (block_K, block_N), "float16", scope="shared"
                         )
+                        tile_Out = T.alloc_fragment(
+                            (block_M, block_N), config.accum_dtype
+                        )
 
                         for i, j in T.Parallel(block_M, block_N):
-                            x_idx = bx * block_M + i
-                            y_idx = by * block_N + j
-                            if x_idx < M and y_idx < N:
-                                D[x_idx, y_idx] = 0.0
+                            tile_Out[i, j] = 0.0
 
                         for bz in range(T.ceildiv(K, block_K)):
                             load_tiles(A, B, tile_A, tile_W, bx, by, bz)
@@ -164,7 +160,7 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                                             * T.cast(tile_W[k, j], config.accum_dtype)
                                         )
                                     if x_idx < M and y_idx < N:
-                                        D[x_idx, y_idx] += acc[0] * C[(bz * block_K) // group_size, y_idx]
+                                        tile_Out[i, j] += acc[0] * C[(bz * block_K) // group_size, y_idx]
                                 else:
                                     # A tile may cross groups. Select the scale for each k.
                                     for k in T.serial(block_K):
@@ -176,8 +172,14 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                                                 * C[k_idx // group_size, y_idx]
                                             )
                                     if x_idx < M and y_idx < N:
-                                        D[x_idx, y_idx] += acc[0]
+                                        tile_Out[i, j] += acc[0]
                             T.sync_threads()
+
+                        for i, j in T.Parallel(block_M, block_N):
+                            x_idx = bx * block_M + i
+                            y_idx = by * block_N + j
+                            if x_idx < M and y_idx < N:
+                                D[x_idx, y_idx] = T.cast(tile_Out[i, j], config.out_dtype)
 
                 return grouped_matmul_int4
 
@@ -196,13 +198,18 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                         T.ceildiv(N, block_N),
                         threads=threads,
                     ) as (bx, by):
-                        matmul_tile(A, B, D, bx, by)
-                        # Each column has one scale, independent of k. Apply it once.
+                        tile_Out = T.alloc_fragment(
+                            (block_M, block_N), config.accum_dtype
+                        )
+                        matmul_tile(A, B, tile_Out, bx, by)
+                        # Multiply in FP32, then convert once when writing the output.
                         for i, j in T.Parallel(block_M, block_N):
                             x_idx = bx * block_M + i
                             y_idx = by * block_N + j
                             if x_idx < M and y_idx < N:
-                                D[x_idx, y_idx] *= C[y_idx]
+                                D[x_idx, y_idx] = T.cast(
+                                    tile_Out[i, j] * C[y_idx], config.out_dtype
+                                )
 
                 return scaled_matmul_int4
 
@@ -217,7 +224,15 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                     T.ceildiv(N, block_N),
                     threads=threads,
                 ) as (bx, by):
-                    matmul_tile(A, B, C, bx, by)
+                    tile_Out = T.alloc_fragment(
+                        (block_M, block_N), config.accum_dtype
+                    )
+                    matmul_tile(A, B, tile_Out, bx, by)
+                    for i, j in T.Parallel(block_M, block_N):
+                        x_idx = bx * block_M + i
+                        y_idx = by * block_N + j
+                        if x_idx < M and y_idx < N:
+                            C[x_idx, y_idx] = T.cast(tile_Out[i, j], config.out_dtype)
 
             return tiled_matmul_int4
 

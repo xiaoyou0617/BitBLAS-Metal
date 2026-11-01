@@ -3,7 +3,7 @@ from .base import MatmulKernel, MatmulScheduler
 
 
 class TiledMatmulScheduler(MatmulScheduler):
-    """build the existing shared-memory tiled kernel for Metal."""
+    """Build a Metal kernel with FP32 accumulation and FP16 or FP32 output."""
 
     device_type = "mps"
 
@@ -47,13 +47,11 @@ class TiledMatmulScheduler(MatmulScheduler):
                 ) as (bx, by):
                     tile_A = T.alloc_shared((block_M, block_K), config.A_dtype, scope="shared")
                     tile_W = T.alloc_shared((block_K, block_N), config.W_dtype, scope="shared")
+                    tile_Out = T.alloc_fragment((block_M, block_N), config.accum_dtype)
 
-                    # Reset this block's output tile once before accumulating K tiles.
+                    # Thread-private accumulators retain FP32 values across all K tiles.
                     for i, j in T.Parallel(block_M, block_N):
-                        x_idx = i + bx * block_M
-                        y_idx = j + by * block_N
-                        if x_idx < M and y_idx < N:
-                            C[x_idx, y_idx] = 0.0
+                        tile_Out[i, j] = 0.0
 
                     for bz in range(T.ceildiv(K, block_K)):
                         # filling the shared tiles
@@ -83,10 +81,16 @@ class TiledMatmulScheduler(MatmulScheduler):
                                     T.cast(tile_A[i, k], config.accum_dtype)
                                     * T.cast(tile_W[k, j], config.accum_dtype)
                                 )
-                            x_idx = i + bx * block_M
-                            y_idx = j + by * block_N
-                            if x_idx < M and y_idx < N:
-                                C[x_idx, y_idx] += acc[0]
+                            tile_Out[i, j] += acc[0]
+                        # All shared-memory reads must finish before the next load.
+                        T.sync_threads()
+
+                    # Convert exactly once, when the complete output is stored.
+                    for i, j in T.Parallel(block_M, block_N):
+                        x_idx = i + bx * block_M
+                        y_idx = j + by * block_N
+                        if x_idx < M and y_idx < N:
+                            C[x_idx, y_idx] = T.cast(tile_Out[i, j], config.out_dtype)
 
             return tiled_matmul
 
