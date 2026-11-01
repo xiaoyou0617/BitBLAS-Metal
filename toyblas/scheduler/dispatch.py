@@ -22,9 +22,6 @@ def select_scheduler(
         raise ValueError(
             f"backend must be 'auto', 'torch', or 'tilelang'; got {backend!r}."
         )
-    if config.requires_dequant:
-        raise NotImplementedError("Weight dequantization is not implemented yet.")
-
     if device is None:
         target = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     else:
@@ -48,6 +45,11 @@ def select_scheduler(
         from .torch_mps import TorchMPSMatmulScheduler
 
         return TorchMPSMatmulScheduler(config)
+
+    if config.requires_dequant:
+        from .weigh_dequant import WeightDequantMatmulScheduler
+
+        return WeightDequantMatmulScheduler(config)
 
     from .tiled import TiledMatmulScheduler
 

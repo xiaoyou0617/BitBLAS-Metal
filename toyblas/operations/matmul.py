@@ -16,22 +16,36 @@ class Matmul:
         """Select a scheduler and build once; calls require inputs on self.device."""
         self.config = config
         self.torch_A_dtype = getattr(torch, config.A_dtype)
-        self.torch_W_dtype = getattr(torch, config.W_dtype)
+        packed_int4 = config.W_dtype == "int4"
+        self.torch_W_dtype = torch.uint8 if packed_int4 else getattr(torch, config.W_dtype)
         self.torch_out_dtype = getattr(torch, config.out_dtype)
         self.scheduler = select_scheduler(config, device=device, backend=backend)
         self.device = self.scheduler.device
         self.calculas = self.scheduler.build()
         self.shape_A = (config.M, config.K)
-        self.shape_W = (config.K, config.N)
+        # config.N describes logical columns; packed INT4 uses half as many bytes.
+        self.shape_W = (config.K, (config.N + 1) // 2 if packed_int4 else config.N)
         self.shape_C = (config.M, config.N)
+        if config.group_size > 0:
+            self.shape_scales = (
+                (config.K + config.group_size - 1) // config.group_size, config.N
+            )
+        else:
+            self.shape_scales = (config.N,)
 
     def __call__(
         self,
         A: torch.Tensor,
         W: torch.Tensor,
         out: Optional[torch.Tensor] = None,
+        *,
+        scales: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute on the selected device, optionally using an independent output buffer."""
+        """Compute with per-column or K-grouped FP32 scales from the config.
+
+        scales is required when config.with_scaling is True and must otherwise
+        be omitted. Calls validate its metadata without reading device values.
+        """
         for name, tensor, expected_shape, expected_dtype in (
             ("A", A, self.shape_A, self.torch_A_dtype),
             ("W", W, self.shape_W, self.torch_W_dtype),
@@ -53,6 +67,28 @@ class Matmul:
                     f"{name} must be on {self.device}; got device {tensor.device}. "
                     f"Move it with {name}.to('{self.device}') before calling Matmul."
                 )
+
+        if self.config.with_scaling:
+            if scales is None:
+                raise ValueError("scales is required when with_scaling=True.")
+            if not isinstance(scales, torch.Tensor):
+                raise TypeError(
+                    f"scales must be a torch.Tensor; got {type(scales).__name__}."
+                )
+            if tuple(scales.shape) != self.shape_scales:
+                raise ValueError(
+                    f"scales must have shape {self.shape_scales}; "
+                    f"got {tuple(scales.shape)}."
+                )
+            if scales.dtype != torch.float32:
+                raise TypeError(f"scales must have dtype torch.float32; got {scales.dtype}.")
+            if scales.device.type != self.device.type:
+                raise ValueError(
+                    f"scales must be on {self.device}; got device {scales.device}. "
+                    f"Move it with scales.to('{self.device}') before calling Matmul."
+                )
+        elif scales is not None:
+            raise ValueError("scales must be omitted when with_scaling=False.")
 
         if out is None:
             C = torch.empty(
@@ -83,7 +119,10 @@ class Matmul:
                     f"out must be contiguous; got strides {out.stride()}. "
                     "Provide a contiguous output buffer on the selected device."
                 )
-            for name, tensor in (("A", A), ("W", W)):
+            inputs = (("A", A), ("W", W))
+            if scales is not None:
+                inputs += (("scales", scales),)
+            for name, tensor in inputs:
                 if out.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr():
                     raise ValueError(
                         f"out must not share storage with {name}; "
@@ -93,5 +132,8 @@ class Matmul:
 
         A = A.contiguous()
         W = W.contiguous()
-        self.calculas(A, W, C)
+        if self.config.with_scaling:
+            self.calculas(A, W, scales.contiguous(), C)
+        else:
+            self.calculas(A, W, C)
         return C

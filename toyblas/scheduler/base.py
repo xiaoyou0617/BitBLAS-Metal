@@ -6,11 +6,11 @@ import torch
 from ..operations.config import MatmulConfig
 
 
-MatmulKernel = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], Any]
+MatmulKernel = Callable[..., Any]
 
 
 class MatmulScheduler(ABC):
-    """Build a reusable callable with the argument order (A, W, out)."""
+    """Build (A, W, out), or (A, W, scales, out) when scaling is enabled."""
 
     device_type: str
 

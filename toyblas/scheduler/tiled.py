@@ -3,7 +3,7 @@ from .base import MatmulKernel, MatmulScheduler
 
 
 class TiledMatmulScheduler(MatmulScheduler):
-    """Build the existing shared-memory tiled kernel for Metal."""
+    """build the existing shared-memory tiled kernel for Metal."""
 
     device_type = "mps"
 
