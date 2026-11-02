@@ -41,12 +41,15 @@ class Matmul:
         out: Optional[torch.Tensor] = None,
         *,
         scales: Optional[torch.Tensor] = None,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute A @ W (nn) or A @ W.T (nt), optionally using FP32 scales.
 
         scales is required when config.with_scaling is True and must otherwise
         be omitted. Calls validate its metadata without reading device values.
         Grouping always follows logical K; scales keep the same shape in both layouts.
+        With with_bias=True, bias must be FP32 [N] on the selected device.
+        It is added after scaling and before the final output conversion.
         """
         for name, tensor, expected_shape, expected_dtype in (
             ("A", A, self.shape_A, self.torch_A_dtype),
@@ -92,6 +95,23 @@ class Matmul:
         elif scales is not None:
             raise ValueError("scales must be omitted when with_scaling=False.")
 
+        if self.config.with_bias:
+            if bias is None:
+                raise ValueError("bias is required when with_bias=True.")
+            if not isinstance(bias, torch.Tensor):
+                raise TypeError(f"bias must be a torch.Tensor; got {type(bias).__name__}.")
+            if tuple(bias.shape) != (self.config.N,):
+                raise ValueError(f"bias must have shape {(self.config.N,)}; got {tuple(bias.shape)}.")
+            if bias.dtype != torch.float32:
+                raise TypeError(f"bias must have dtype torch.float32; got {bias.dtype}.")
+            if bias.device.type != self.device.type:
+                raise ValueError(
+                    f"bias must be on {self.device}; got device {bias.device}. "
+                    f"Move it with bias.to('{self.device}') before calling Matmul."
+                )
+        elif bias is not None:
+            raise ValueError("bias must be omitted when with_bias=False.")
+
         if out is None:
             C = torch.empty(
                 self.shape_C,
@@ -124,6 +144,8 @@ class Matmul:
             inputs = (("A", A), ("W", W))
             if scales is not None:
                 inputs += (("scales", scales),)
+            if bias is not None:
+                inputs += (("bias", bias),)
             for name, tensor in inputs:
                 if out.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr():
                     raise ValueError(
@@ -134,8 +156,11 @@ class Matmul:
 
         A = A.contiguous()
         W = W.contiguous()
+        arguments = [A, W]
         if self.config.with_scaling:
-            self.calculas(A, W, scales.contiguous(), C)
-        else:
-            self.calculas(A, W, C)
+            arguments.append(scales.contiguous())
+        if self.config.with_bias:
+            arguments.append(bias.contiguous())
+        arguments.append(C)
+        self.calculas(*arguments)
         return C

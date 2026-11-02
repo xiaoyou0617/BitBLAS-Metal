@@ -8,6 +8,76 @@ from bitblas_metal.test._helpers import check_matmul, config_label, configs_for,
 
 
 class MatmulSmokeChecks:
+    def test_bias_after_scaling_known_answers(self):
+        # Product per first-row output: raw=4, column-scaled=8,
+        # grouped (g=2)=22, grouped (g=3)=13. Bias must be added once, unscaled.
+        for layout in ("nn", "nt"):
+            for out_dtype in ("float32", "float16"):
+                for scaling, group, product in ((False, 0, 4), (True, 0, 8),
+                                                (True, 2, 22), (True, 3, 13)):
+                    with self.subTest(layout=layout, out_dtype=out_dtype, group=group,
+                                      scaling=scaling):
+                        config = MatmulConfig(2, 3, 4, A_dtype="float16", W_dtype="int4",
+                                              out_dtype=out_dtype, layout=layout,
+                                              with_scaling=scaling, group_size=group,
+                                              with_bias=True, tile=(3, 3, 3))
+                        A = torch.tensor([[1] * 4, [2] * 4], dtype=torch.float16,
+                                         device=self.device)
+                        codes = torch.ones((4, 3) if layout == "nn" else (3, 4), dtype=torch.int8)
+                        W = pack_int4(codes).to(self.device)
+                        bias = torch.tensor([5, -1, 0.25], dtype=torch.float32, device=self.device)
+                        scales = None
+                        if scaling:
+                            scales = torch.tensor([[1] * 3, [10] * 3], dtype=torch.float32,
+                                                  device=self.device) if group else torch.full(
+                                                      (3,), 2.0, device=self.device)
+                        expected = (torch.tensor([[product], [2 * product]])
+                                    + torch.tensor([5, -1, 0.25])).to(getattr(torch, out_dtype))
+                        op = Matmul(config, device=self.device, backend=self.backend)
+                        torch.testing.assert_close(op(A, W, scales=scales, bias=bias).cpu(),
+                                                   expected, rtol=0, atol=0)
+
+    def test_bias_before_fp16_output_conversion(self):
+        modes = (("float16", False, 0), ("int4", False, 0),
+                 ("int4", True, 0), ("int4", True, 1))
+        for W_dtype, scaling, group in modes:
+            config = MatmulConfig(1, 1, 2, A_dtype="float16", W_dtype=W_dtype,
+                                  out_dtype="float16", with_scaling=scaling,
+                                  group_size=group, with_bias=True, tile=(2, 3, 1))
+            op = Matmul(config, device=self.device, backend=self.backend)
+            W = (pack_int4(torch.ones((1, 2), dtype=torch.int8)).to(self.device)
+                 if W_dtype == "int4" else torch.ones((1, 2), dtype=torch.float16, device=self.device))
+            scales = torch.ones((2, 1) if group else (1,), device=self.device) if scaling else None
+            for values, offset, answer in (([2048, 1], 1, 2050),
+                                           ([40000, 40000], -40000, 40000)):
+                with self.subTest(W_dtype=W_dtype, scaling=scaling, group=group, values=values):
+                    A = torch.tensor([values], dtype=torch.float16, device=self.device)
+                    bias = torch.tensor([offset], dtype=torch.float32, device=self.device)
+                    expected = torch.tensor([[answer]], dtype=torch.float16)
+                    torch.testing.assert_close(op(A, W, scales=scales, bias=bias).cpu(),
+                                               expected, rtol=0, atol=0)
+
+    def test_bias_contract(self):
+        config = MatmulConfig(1, 3, 2, with_bias=True)
+        op = Matmul(config, device=self.device, backend=self.backend)
+        A = torch.ones((1, 2), device=self.device)
+        W = torch.ones((3, 2), device=self.device)
+        bias = torch.ones(3, device=self.device)
+        for bad_bias, error in ((None, ValueError), (1.0, TypeError),
+                                (torch.ones((3, 1), device=self.device), ValueError),
+                                (bias[:2], ValueError), (bias.half(), TypeError)):
+            with self.subTest(bias_type=type(bad_bias).__name__, error=error.__name__):
+                with self.assertRaises(error):
+                    op(A, W, bias=bad_bias)
+        with self.assertRaises(ValueError):
+            op(A, W, out=bias.view(1, 3), bias=bias)
+        if self.device == "mps":
+            with self.assertRaises(ValueError):
+                op(A, W, bias=bias.cpu())
+        no_bias = Matmul(MatmulConfig(1, 3, 2), device=self.device, backend=self.backend)
+        with self.assertRaises(ValueError):
+            no_bias(A, W, bias=bias)
+
     def test_supported_dtype_combinations(self):
         # Every dimension has a tail; odd block_N exercises bytes crossing N tiles.
         for config in configs_for((5, 7, 11), (4, 3, 4), group_size=8):
@@ -80,7 +150,8 @@ class MatmulSmokeChecks:
                     scales = torch.ones(shape, device=self.device)
                 op = Matmul(config, device=self.device, backend=self.backend)
                 expected = torch.tensor([[2050.0]], dtype=torch.float16)
-                torch.testing.assert_close(op(A, W, scales=scales).cpu(), expected,
+                bias = torch.zeros(1, device=self.device) if config.with_bias else None
+                torch.testing.assert_close(op(A, W, scales=scales, bias=bias).cpu(), expected,
                                            rtol=0, atol=0)
 
     def test_fp16_scaling_precedes_output_conversion(self):

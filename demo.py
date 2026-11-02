@@ -26,14 +26,17 @@ def main():
         with_scaling=True,
         group_size=128,
         layout="nt",
+        with_bias=True,
     )
     qW, scales = quantize_int4_with_grouping(W, config.group_size)
+
+    bias = torch.randn(config.N, dtype=torch.float32)
 
     # Build the CPU reference before moving the packed data to MPS.
     # Every K row uses the scale of its quantization group.
     group_ids = torch.arange(config.K) // config.group_size
     W_reconstructed = qW.float() * scales[group_ids]
-    reference = A.float() @ W_reconstructed
+    reference = A.float() @ W_reconstructed + bias
 
     # Quantization uses logical [K,N]; prepare the configured storage once.
     stored_codes = qW if config.layout == "nn" else qW.T.contiguous()
@@ -41,12 +44,12 @@ def main():
     A_mps = A.to("mps")
     scales_mps = scales.to("mps")
     op = Matmul(config, device="mps", backend="tilelang")
-    C = op(A_mps, W_packed, scales=scales_mps).cpu()
+    C = op(A_mps, W_packed, scales=scales_mps, bias=bias.to("mps")).cpu()
 
     # Kernel correctness and quantization error are separate questions.
     torch.testing.assert_close(C, reference, rtol=1e-4, atol=1e-4)
     kernel_max_error = (C - reference).abs().max().item()
-    original_reference = A.float() @ W.float()
+    original_reference = A.float() @ W.float() + bias
     quantization_rmse = (reference - original_reference).square().mean().sqrt().item()
 
     print(f"Kernel correctness: PASS; shape={tuple(C.shape)}, dtype={C.dtype}")

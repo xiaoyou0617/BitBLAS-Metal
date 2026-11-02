@@ -7,6 +7,10 @@ from bitblas_metal.operations.config import SUPPORTED_DTYPE_COMBINATIONS
 
 
 class TestMatmulConfig(unittest.TestCase):
+    def test_bias_flag(self):
+        self.assertFalse(MatmulConfig(2, 3, 4).with_bias)
+        self.assertTrue(MatmulConfig(2, 3, 4, with_bias=True).with_bias)
+
     def test_layout_defaults_to_nt(self):
         self.assertEqual(MatmulConfig(2, 3, 4).layout, "nt")
         for layout in ("nn", "nt"):
@@ -44,6 +48,8 @@ class TestMatmulConfig(unittest.TestCase):
             ({"layout": "tn"}, ValueError), ({"layout": "tt"}, ValueError),
             ({"layout": "NT"}, ValueError), ({"layout": ""}, ValueError),
             ({"layout": None}, TypeError), ({"layout": ["nn"]}, TypeError),
+            ({"with_bias": 1}, TypeError), ({"with_bias": None}, TypeError),
+            ({"with_bias": "true"}, TypeError),
         )
         for changes, error in cases:
             with self.subTest(changes=changes):

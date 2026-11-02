@@ -30,11 +30,13 @@ def configs_for(shape, tile, group_size):
             if W_dtype == "int4":
                 modes += ((True, 0), (True, group_size))
             for with_scaling, group in modes:
-                yield MatmulConfig(
-                    M, N, K, A_dtype=A_dtype, W_dtype=W_dtype,
-                    accum_dtype=accum_dtype, out_dtype=out_dtype, tile=tile,
-                    with_scaling=with_scaling, group_size=group, layout=layout,
-                )
+                for with_bias in (False, True):
+                    yield MatmulConfig(
+                        M, N, K, A_dtype=A_dtype, W_dtype=W_dtype,
+                        accum_dtype=accum_dtype, out_dtype=out_dtype, tile=tile,
+                        with_scaling=with_scaling, group_size=group, layout=layout,
+                        with_bias=with_bias,
+                    )
 
 
 def config_label(config):
@@ -43,6 +45,7 @@ def config_label(config):
         "shape": (config.M, config.N, config.K),
         "tile": config.tile,
         "layout": config.layout,
+        "with_bias": config.with_bias,
         "scaling": config.with_scaling,
         "group_size": config.group_size,
     }
@@ -91,13 +94,19 @@ def check_matmul(test, config, device, backend, *, noncontiguous=False, reuse=Fa
         if config.layout == "nt":
             W_cpu = W_cpu.T.contiguous()
 
-    reference = (A_cpu.double() @ W_reference).to(getattr(torch, config.out_dtype))
+    product_reference = A_cpu.double() @ W_reference
+    bias_cpu = torch.randn(config.N, generator=generator) * 0.25 if config.with_bias else None
+    reference = product_reference + bias_cpu.double() if bias_cpu is not None else product_reference
+    reference = reference.to(getattr(torch, config.out_dtype))
     A, W = A_cpu.to(device), W_cpu.to(device)
     scales = scales_cpu.to(device) if scales_cpu is not None else None
+    bias = bias_cpu.to(device) if bias_cpu is not None else None
     if noncontiguous:
         A, W = noncontiguous_copy(A), noncontiguous_copy(W)
         if scales is not None:
             scales = noncontiguous_copy(scales)
+        if bias is not None:
+            bias = noncontiguous_copy(bias)
     op = Matmul(config, device=device, backend=backend)
 
     def assert_result(result, expected):
@@ -110,15 +119,19 @@ def check_matmul(test, config, device, backend, *, noncontiguous=False, reuse=Fa
         rtol = 1e-3 if config.out_dtype == "float16" else 1e-4
         torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=1e-4)
 
-    assert_result(op(A, W, scales=scales), reference)
+    assert_result(op(A, W, scales=scales, bias=bias), reference)
     if reuse:
         # A poisoned output detects missing initialization and accidental accumulation.
         out = torch.full((config.M, config.N), float("nan"), device=device,
                          dtype=getattr(torch, config.out_dtype))
-        test.assertIs(op(A, W, out=out, scales=scales), out)
+        test.assertIs(op(A, W, out=out, scales=scales, bias=bias), out)
         assert_result(out, reference)
         # Reuse the same built kernel with new activation and scale values.
         new_scales = scales * 2 if scales is not None else None
-        expected = -reference * (2 if scales is not None else 1)
-        test.assertIs(op(-A, W, out=out, scales=new_scales), out)
+        new_bias = -bias if bias is not None else None
+        expected = -product_reference * (2 if scales is not None else 1)
+        if bias_cpu is not None:
+            expected = expected - bias_cpu.double()
+        expected = expected.to(getattr(torch, config.out_dtype))
+        test.assertIs(op(-A, W, out=out, scales=new_scales, bias=new_bias), out)
         assert_result(out, expected)

@@ -22,6 +22,7 @@ should be checked explicitly.
 - A16W4: FP16 activations with signed INT4 weights packed into `uint8` storage.
 - FP32 computation and accumulation with FP16 or FP32 output. Scaling is applied
   before the final output conversion.
+- Optional FP32 bias, fused after scaling and before the final output conversion.
 - Symmetric INT4 weight quantization with per-column or K-grouped FP32 scales.
 - Tail handling, noncontiguous inputs, reusable output buffers, and input checks.
 - Smoke and larger-matrix correctness regression suites.
@@ -74,18 +75,20 @@ config = MatmulConfig(
     accum_dtype="float32",
     out_dtype="float16",
     layout="nt",
+    with_bias=True,
     tile=(8, 8, 8),
 )
 op = Matmul(config, device="mps", backend="tilelang")
 
 A = torch.randn((config.M, config.K), dtype=torch.float16, device="mps")
 W = torch.randn((config.N, config.K), dtype=torch.float16, device="mps")
-C = op(A, W)
+bias = torch.randn(config.N, dtype=torch.float32, device="mps")
+C = op(A, W, bias=bias)
 assert C.shape == (config.M, config.N) and C.dtype == torch.float16
 
 # Reuse both the compiled kernel and an output buffer.
 out = torch.empty_like(C)
-assert op(A, W, out=out) is out
+assert op(A, W, out=out, bias=bias) is out
 ```
 
 `tile` is `(block_M, block_N, block_K)`. Operator construction selects and builds
@@ -96,6 +99,11 @@ Use `layout="nn"` with physical weights `[K,N]` to compute `A @ W`.
 Both paths load their weight format directly into a shared `[block_K,block_N]`
 tile; the Metal path does not transpose the full weight matrix on each call.
 Existing calls that pass `[K,N]` weights should explicitly set `layout="nn"`.
+
+Set `with_bias=True` when constructing the operator, then provide `bias=` on each
+call. Bias must be an FP32 `[N]` tensor on the selected device and broadcasts
+over M. It is added once after all accumulation and scaling, before conversion
+to the output dtype. Omit `bias` when `with_bias=False` (the default).
 
 ## Grouped A16W4 matmul
 
@@ -117,6 +125,7 @@ config = MatmulConfig(
     with_scaling=True,
     group_size=32,
     layout="nt",
+    with_bias=True,
     tile=(8, 8, 8),
 )
 # Quantizers always take logical [K,N], regardless of the matmul layout.
@@ -125,9 +134,10 @@ qW, scales = quantize_int4_with_grouping(W_logical, config.group_size)
 W_packed = pack_int4(qW.T.contiguous()).to("mps")  # nt: [N,ceil(K/2)]
 scales = scales.to("mps")
 A = torch.randn((config.M, config.K), dtype=torch.float16, device="mps")
+bias = torch.randn(config.N, dtype=torch.float32, device="mps")
 
 op = Matmul(config, device="mps", backend="tilelang")
-C = op(A, W_packed, scales=scales)
+C = op(A, W_packed, scales=scales, bias=bias)
 assert C.shape == (config.M, config.N) and C.dtype == torch.float16
 ```
 
@@ -144,6 +154,7 @@ assert C.shape == (config.M, config.N) and C.dtype == torch.float16
 | Packed INT4 weights, `nt` | `[N, ceil(K / 2)]`, `torch.uint8` |
 | Per-column scales, `group_size=0` | `[N]`, `torch.float32` |
 | Grouped scales, `group_size>0` | `[ceil(K / group_size), N]`, `torch.float32` |
+| Bias, `with_bias=True` | `[N]`, `torch.float32`, on the selected device |
 | Output | `[M, N]`, FP16 or FP32 as configured |
 
 Packing runs along the physical last dimension: N for `nn`, K for `nt`.

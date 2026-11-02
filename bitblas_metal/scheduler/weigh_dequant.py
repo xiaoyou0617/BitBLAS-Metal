@@ -35,7 +35,7 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
         @tilelang.jit(
             target="metal",
             execution_backend="torch",
-            out_idx=[3] if self.config.with_scaling else [2],
+            out_idx=[2 + int(self.config.with_scaling) + int(self.config.with_bias)],
         )
         def generate_matmul(config: MatmulConfig, threads: int):
             block_M = config.tile[0]
@@ -155,8 +155,75 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                     # Finish all reads before the next K tile overwrites shared memory.
                     T.sync_threads()
 
+            # Scales precede bias, and output is last: A/B/C/D/E for both extras.
             if config.with_scaling and group_size > 0:
                 num_groups = (K + group_size - 1) // group_size
+
+                @T.macro
+                def grouped_matmul_tile(A, B, C, tile_Out, bx, by):
+                    tile_A = T.alloc_shared(
+                        (block_M, block_K), config.A_dtype, scope="shared"
+                    )
+                    tile_W = T.alloc_shared(
+                        (block_K, block_N), "float16", scope="shared"
+                    )
+
+                    for i, j in T.Parallel(block_M, block_N):
+                        tile_Out[i, j] = 0.0
+
+                    for bz in range(T.ceildiv(K, block_K)):
+                        load_tiles(A, B, tile_A, tile_W, bx, by, bz)
+                        T.sync_threads()
+                        acc = T.alloc_local((1,), config.accum_dtype)
+                        for i, j in T.Parallel(block_M, block_N):
+                            acc[0] = 0.0
+                            x_idx = bx * block_M + i
+                            y_idx = by * block_N + j
+                            if group_size % block_K == 0:
+                                # Every valid k in this tile belongs to the same group.
+                                for k in T.serial(block_K):
+                                    acc[0] += (
+                                        T.cast(tile_A[i, k], config.accum_dtype)
+                                        * T.cast(tile_W[k, j], config.accum_dtype)
+                                    )
+                                if x_idx < M and y_idx < N:
+                                    tile_Out[i, j] += acc[0] * C[(bz * block_K) // group_size, y_idx]
+                            else:
+                                # A tile may cross groups. Select the scale for each k.
+                                for k in T.serial(block_K):
+                                    k_idx = bz * block_K + k
+                                    if k_idx < K and y_idx < N:
+                                        acc[0] += (
+                                            T.cast(tile_A[i, k], config.accum_dtype)
+                                            * T.cast(tile_W[k, j], config.accum_dtype)
+                                            * C[k_idx // group_size, y_idx]
+                                        )
+                                if x_idx < M and y_idx < N:
+                                    tile_Out[i, j] += acc[0]
+                        T.sync_threads()
+
+                if config.with_bias:
+                    @T.prim_func
+                    def grouped_matmul_int4_bias(
+                        A: T.Tensor((M, K), dtype=config.A_dtype),
+                        B: T.Tensor(packed_weight_shape, dtype="uint8"),
+                        C: T.Tensor((num_groups, N), dtype="float32"),
+                        D: T.Tensor((N,), dtype="float32"),
+                        E: T.Tensor((M, N), dtype=config.out_dtype),
+                    ):
+                        with T.Kernel(
+                            T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
+                        ) as (bx, by):
+                            tile_Out = T.alloc_fragment((block_M, block_N), config.accum_dtype)
+                            grouped_matmul_tile(A, B, C, tile_Out, bx, by)
+                            # Scaling and bias stay in FP32; convert only at the final store.
+                            for i, j in T.Parallel(block_M, block_N):
+                                x_idx = bx * block_M + i
+                                y_idx = by * block_N + j
+                                if x_idx < M and y_idx < N:
+                                    E[x_idx, y_idx] = T.cast(tile_Out[i, j] + D[y_idx], config.out_dtype)
+
+                    return grouped_matmul_int4_bias
 
                 @T.prim_func
                 def grouped_matmul_int4(
@@ -166,54 +233,11 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                     D: T.Tensor((M, N), dtype=config.out_dtype),
                 ):
                     with T.Kernel(
-                        T.ceildiv(M, block_M),
-                        T.ceildiv(N, block_N),
-                        threads=threads,
+                        T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
                     ) as (bx, by):
-                        tile_A = T.alloc_shared(
-                            (block_M, block_K), config.A_dtype, scope="shared"
-                        )
-                        tile_W = T.alloc_shared(
-                            (block_K, block_N), "float16", scope="shared"
-                        )
-                        tile_Out = T.alloc_fragment(
-                            (block_M, block_N), config.accum_dtype
-                        )
-
-                        for i, j in T.Parallel(block_M, block_N):
-                            tile_Out[i, j] = 0.0
-
-                        for bz in range(T.ceildiv(K, block_K)):
-                            load_tiles(A, B, tile_A, tile_W, bx, by, bz)
-                            T.sync_threads()
-                            acc = T.alloc_local((1,), config.accum_dtype)
-                            for i, j in T.Parallel(block_M, block_N):
-                                acc[0] = 0.0
-                                x_idx = bx * block_M + i
-                                y_idx = by * block_N + j
-                                if group_size % block_K == 0:
-                                    # Every valid k in this tile belongs to the same group.
-                                    for k in T.serial(block_K):
-                                        acc[0] += (
-                                            T.cast(tile_A[i, k], config.accum_dtype)
-                                            * T.cast(tile_W[k, j], config.accum_dtype)
-                                        )
-                                    if x_idx < M and y_idx < N:
-                                        tile_Out[i, j] += acc[0] * C[(bz * block_K) // group_size, y_idx]
-                                else:
-                                    # A tile may cross groups. Select the scale for each k.
-                                    for k in T.serial(block_K):
-                                        k_idx = bz * block_K + k
-                                        if k_idx < K and y_idx < N:
-                                            acc[0] += (
-                                                T.cast(tile_A[i, k], config.accum_dtype)
-                                                * T.cast(tile_W[k, j], config.accum_dtype)
-                                                * C[k_idx // group_size, y_idx]
-                                            )
-                                    if x_idx < M and y_idx < N:
-                                        tile_Out[i, j] += acc[0]
-                            T.sync_threads()
-
+                        tile_Out = T.alloc_fragment((block_M, block_N), config.accum_dtype)
+                        grouped_matmul_tile(A, B, C, tile_Out, bx, by)
+                        # Scaling and bias stay in FP32; convert only at the final store.
                         for i, j in T.Parallel(block_M, block_N):
                             x_idx = bx * block_M + i
                             y_idx = by * block_N + j
@@ -223,8 +247,29 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                 return grouped_matmul_int4
 
             if config.with_scaling:
-                # A/B/C/D names keep positional Metal bindings in argument order:
-                # C is the scale vector here; D is the output.
+                if config.with_bias:
+                    @T.prim_func
+                    def scaled_matmul_int4_bias(
+                        A: T.Tensor((M, K), dtype=config.A_dtype),
+                        B: T.Tensor(packed_weight_shape, dtype="uint8"),
+                        C: T.Tensor((N,), dtype="float32"),
+                        D: T.Tensor((N,), dtype="float32"),
+                        E: T.Tensor((M, N), dtype=config.out_dtype),
+                    ):
+                        with T.Kernel(
+                            T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
+                        ) as (bx, by):
+                            tile_Out = T.alloc_fragment((block_M, block_N), config.accum_dtype)
+                            matmul_tile(A, B, tile_Out, bx, by)
+                            # Scaling and bias stay in FP32; convert only at the final store.
+                            for i, j in T.Parallel(block_M, block_N):
+                                x_idx = bx * block_M + i
+                                y_idx = by * block_N + j
+                                if x_idx < M and y_idx < N:
+                                    E[x_idx, y_idx] = T.cast((tile_Out[i, j] * C[y_idx]) + D[y_idx], config.out_dtype)
+
+                    return scaled_matmul_int4_bias
+
                 @T.prim_func
                 def scaled_matmul_int4(
                     A: T.Tensor((M, K), dtype=config.A_dtype),
@@ -233,24 +278,40 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                     D: T.Tensor((M, N), dtype=config.out_dtype),
                 ):
                     with T.Kernel(
-                        T.ceildiv(M, block_M),
-                        T.ceildiv(N, block_N),
-                        threads=threads,
+                        T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
                     ) as (bx, by):
-                        tile_Out = T.alloc_fragment(
-                            (block_M, block_N), config.accum_dtype
-                        )
+                        tile_Out = T.alloc_fragment((block_M, block_N), config.accum_dtype)
                         matmul_tile(A, B, tile_Out, bx, by)
-                        # Multiply in FP32, then convert once when writing the output.
+                        # Scaling and bias stay in FP32; convert only at the final store.
                         for i, j in T.Parallel(block_M, block_N):
                             x_idx = bx * block_M + i
                             y_idx = by * block_N + j
                             if x_idx < M and y_idx < N:
-                                D[x_idx, y_idx] = T.cast(
-                                    tile_Out[i, j] * C[y_idx], config.out_dtype
-                                )
+                                D[x_idx, y_idx] = T.cast(tile_Out[i, j] * C[y_idx], config.out_dtype)
 
                 return scaled_matmul_int4
+
+            if config.with_bias:
+                @T.prim_func
+                def tiled_matmul_int4_bias(
+                    A: T.Tensor((M, K), dtype=config.A_dtype),
+                    B: T.Tensor(packed_weight_shape, dtype="uint8"),
+                    C: T.Tensor((N,), dtype="float32"),
+                    D: T.Tensor((M, N), dtype=config.out_dtype),
+                ):
+                    with T.Kernel(
+                        T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
+                    ) as (bx, by):
+                        tile_Out = T.alloc_fragment((block_M, block_N), config.accum_dtype)
+                        matmul_tile(A, B, tile_Out, bx, by)
+                        # Scaling and bias stay in FP32; convert only at the final store.
+                        for i, j in T.Parallel(block_M, block_N):
+                            x_idx = bx * block_M + i
+                            y_idx = by * block_N + j
+                            if x_idx < M and y_idx < N:
+                                D[x_idx, y_idx] = T.cast(tile_Out[i, j] + C[y_idx], config.out_dtype)
+
+                return tiled_matmul_int4_bias
 
             @T.prim_func
             def tiled_matmul_int4(
@@ -259,14 +320,11 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                 C: T.Tensor((M, N), dtype=config.out_dtype),
             ):
                 with T.Kernel(
-                    T.ceildiv(M, block_M),
-                    T.ceildiv(N, block_N),
-                    threads=threads,
+                    T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
                 ) as (bx, by):
-                    tile_Out = T.alloc_fragment(
-                        (block_M, block_N), config.accum_dtype
-                    )
+                    tile_Out = T.alloc_fragment((block_M, block_N), config.accum_dtype)
                     matmul_tile(A, B, tile_Out, bx, by)
+                    # Scaling and bias stay in FP32; convert only at the final store.
                     for i, j in T.Parallel(block_M, block_N):
                         x_idx = bx * block_M + i
                         y_idx = by * block_N + j

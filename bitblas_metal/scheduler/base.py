@@ -10,7 +10,7 @@ MatmulKernel = Callable[..., Any]
 
 
 class MatmulScheduler(ABC):
-    """Build (A, W, out), or (A, W, scales, out) when scaling is enabled."""
+    """Build (A, W, [scales], [bias], out), with optional inputs set by config."""
 
     device_type: str
 

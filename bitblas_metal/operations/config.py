@@ -39,6 +39,7 @@ class MatmulConfig:
     group_size: int = 0
     # A[M,K] @ W[K,N] for nn; A[M,K] @ W[N,K].T for nt.
     layout: str = "nt"
+    with_bias: bool = False
 
     def __post_init__(self):
         """Validate dimensions, normalize dtypes, and derive the dequant flag."""
@@ -46,6 +47,8 @@ class MatmulConfig:
             raise TypeError(f"layout must be a string; got {type(self.layout).__name__}.")
         if self.layout not in ("nn", "nt"):
             raise ValueError(f"layout must be 'nn' or 'nt'; got {self.layout!r}.")
+        if not isinstance(self.with_bias, bool):
+            raise TypeError(f"with_bias must be a bool; got {self.with_bias!r}.")
         if not isinstance(self.with_scaling, bool):
             raise TypeError(
                 f"with_scaling must be a bool; got {self.with_scaling!r}."
