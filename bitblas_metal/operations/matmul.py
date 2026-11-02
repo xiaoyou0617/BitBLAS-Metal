@@ -1,8 +1,48 @@
 from typing import Optional, Union
 
 from .config import MatmulConfig
+from .weight import Weight
 from ..scheduler.dispatch import select_scheduler
 import torch
+
+
+def _validate_weight_config(config: MatmulConfig, weight: Weight) -> None:
+    """Check only weight-format fields, allowing reuse across compute settings."""
+    for name, actual, expected in (
+        ("logical_shape", weight.logical_shape, (config.K, config.N)),
+        ("logical_dtype", weight.logical_dtype, config.W_dtype),
+        ("layout", weight.layout, config.layout),
+        ("with_scaling", weight.with_scaling, config.with_scaling),
+        ("group_size", weight.group_size, config.group_size),
+    ):
+        if actual != expected:
+            raise ValueError(
+                f"Weight {name} must match Matmul config ({expected!r}); got {actual!r}."
+            )
+
+
+def _validate_bias(
+    config: MatmulConfig, bias: Optional[torch.Tensor], device: torch.device
+) -> None:
+    """Validate bias metadata without reading values or moving tensors."""
+    if not config.with_bias:
+        if bias is not None:
+            raise ValueError("bias must be omitted when with_bias=False.")
+        return
+    if bias is None:
+        raise ValueError("bias is required when with_bias=True.")
+    if not isinstance(bias, torch.Tensor):
+        raise TypeError(f"bias must be a torch.Tensor; got {type(bias).__name__}.")
+    if tuple(bias.shape) != (config.N,):
+        raise ValueError(f"bias must have shape {(config.N,)}; got {tuple(bias.shape)}.")
+    if bias.dtype != torch.float32:
+        raise TypeError(f"bias must have dtype torch.float32; got {bias.dtype}.")
+    if bias.device.type != device.type:
+        raise ValueError(
+            f"bias must be on {device}; got device {bias.device}. "
+            f"Move it with bias.to('{device}') before calling Matmul."
+        )
+
 
 class Matmul:
 
@@ -37,7 +77,7 @@ class Matmul:
     def __call__(
         self,
         A: torch.Tensor,
-        W: torch.Tensor,
+        W: Union[torch.Tensor, Weight],
         out: Optional[torch.Tensor] = None,
         *,
         scales: Optional[torch.Tensor] = None,
@@ -50,7 +90,18 @@ class Matmul:
         Grouping always follows logical K; scales keep the same shape in both layouts.
         With with_bias=True, bias must be FP32 [N] on the selected device.
         It is added after scaling and before the final output conversion.
+        W may also be a prepared Weight; its format must match config and its
+        scales are supplied automatically. Explicit scales must then be omitted.
         """
+        if isinstance(W, Weight):
+            if scales is not None:
+                raise ValueError(
+                    "scales must be omitted when W is a Weight; "
+                    "its matching scales are stored in W.scales."
+                )
+            _validate_weight_config(self.config, W)
+            scales = W.scales
+            W = W.data
         for name, tensor, expected_shape, expected_dtype in (
             ("A", A, self.shape_A, self.torch_A_dtype),
             ("W", W, self.shape_W, self.torch_W_dtype),
@@ -95,22 +146,7 @@ class Matmul:
         elif scales is not None:
             raise ValueError("scales must be omitted when with_scaling=False.")
 
-        if self.config.with_bias:
-            if bias is None:
-                raise ValueError("bias is required when with_bias=True.")
-            if not isinstance(bias, torch.Tensor):
-                raise TypeError(f"bias must be a torch.Tensor; got {type(bias).__name__}.")
-            if tuple(bias.shape) != (self.config.N,):
-                raise ValueError(f"bias must have shape {(self.config.N,)}; got {tuple(bias.shape)}.")
-            if bias.dtype != torch.float32:
-                raise TypeError(f"bias must have dtype torch.float32; got {bias.dtype}.")
-            if bias.device.type != self.device.type:
-                raise ValueError(
-                    f"bias must be on {self.device}; got device {bias.device}. "
-                    f"Move it with bias.to('{self.device}') before calling Matmul."
-                )
-        elif bias is not None:
-            raise ValueError("bias must be omitted when with_bias=False.")
+        _validate_bias(self.config, bias, self.device)
 
         if out is None:
             C = torch.empty(

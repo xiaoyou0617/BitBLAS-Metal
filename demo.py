@@ -5,8 +5,7 @@ import torch
 from bitblas_metal import (
     Matmul,
     MatmulConfig,
-    pack_int4,
-    quantize_int4_with_grouping,
+    Weight,
 )
 
 
@@ -28,23 +27,19 @@ def main():
         layout="nt",
         with_bias=True,
     )
-    qW, scales = quantize_int4_with_grouping(W, config.group_size)
+    weight = Weight(W, config)
 
     bias = torch.randn(config.N, dtype=torch.float32)
 
     # Build the CPU reference before moving the packed data to MPS.
-    # Every K row uses the scale of its quantization group.
-    group_ids = torch.arange(config.K) // config.group_size
-    W_reconstructed = qW.float() * scales[group_ids]
+    W_reconstructed = weight.dequantize()
     reference = A.float() @ W_reconstructed + bias
 
-    # Quantization uses logical [K,N]; prepare the configured storage once.
-    stored_codes = qW if config.layout == "nn" else qW.T.contiguous()
-    W_packed = pack_int4(stored_codes).to("mps")
+    # Move the packed data and matching scales together; no repeated preparation.
+    weight_mps = weight.to("mps")
     A_mps = A.to("mps")
-    scales_mps = scales.to("mps")
     op = Matmul(config, device="mps", backend="tilelang")
-    C = op(A_mps, W_packed, scales=scales_mps, bias=bias.to("mps")).cpu()
+    C = op(A_mps, weight_mps, bias=bias.to("mps")).cpu()
 
     # Kernel correctness and quantization error are separate questions.
     torch.testing.assert_close(C, reference, rtol=1e-4, atol=1e-4)

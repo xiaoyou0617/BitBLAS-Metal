@@ -3,6 +3,8 @@
 from .operations import (
     Matmul,
     MatmulConfig,
+    Linear,
+    Weight,
     generate_matmul,
     pack_int4,
     quantize_int4,
@@ -13,6 +15,8 @@ from .operations import (
 __all__ = [
     "MatmulConfig",
     "Matmul",
+    "Linear",
+    "Weight",
     "generate_matmul",
     "pack_int4",
     "unpack_int4",
