@@ -25,6 +25,7 @@ def main():
         out_dtype="float32",
         with_scaling=True,
         group_size=128,
+        layout="nt",
     )
     qW, scales = quantize_int4_with_grouping(W, config.group_size)
 
@@ -34,7 +35,9 @@ def main():
     W_reconstructed = qW.float() * scales[group_ids]
     reference = A.float() @ W_reconstructed
 
-    W_packed = pack_int4(qW).to("mps")
+    # Quantization uses logical [K,N]; prepare the configured storage once.
+    stored_codes = qW if config.layout == "nn" else qW.T.contiguous()
+    W_packed = pack_int4(stored_codes).to("mps")
     A_mps = A.to("mps")
     scales_mps = scales.to("mps")
     op = Matmul(config, device="mps", backend="tilelang")

@@ -23,8 +23,9 @@ class Matmul:
         self.device = self.scheduler.device
         self.calculas = self.scheduler.build()
         self.shape_A = (config.M, config.K)
-        # config.N describes logical columns; packed INT4 uses half as many bytes.
-        self.shape_W = (config.K, (config.N + 1) // 2 if packed_int4 else config.N)
+        # Layout describes physical weights; INT4 packs their last dimension.
+        rows, cols = (config.K, config.N) if config.layout == "nn" else (config.N, config.K)
+        self.shape_W = (rows, (cols + 1) // 2 if packed_int4 else cols)
         self.shape_C = (config.M, config.N)
         if config.group_size > 0:
             self.shape_scales = (
@@ -41,10 +42,11 @@ class Matmul:
         *,
         scales: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute with per-column or K-grouped FP32 scales from the config.
+        """Compute A @ W (nn) or A @ W.T (nt), optionally using FP32 scales.
 
         scales is required when config.with_scaling is True and must otherwise
         be omitted. Calls validate its metadata without reading device values.
+        Grouping always follows logical K; scales keep the same shape in both layouts.
         """
         for name, tensor, expected_shape, expected_dtype in (
             ("A", A, self.shape_A, self.torch_A_dtype),

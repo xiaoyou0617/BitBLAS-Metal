@@ -26,7 +26,6 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                 "(A_dtype, W_dtype, accum_dtype, out_dtype) = "
                 "('float16', 'int4', 'float32', 'float16' or 'float32')."
             )
-        self.tile = config.tile
         self.threads = 64
 
     def build(self) -> MatmulKernel:
@@ -38,26 +37,21 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
             execution_backend="torch",
             out_idx=[3] if self.config.with_scaling else [2],
         )
-        def generate_matmul(config: MatmulConfig, tile: tuple, threads: int):
-            block_M = tile[0]
-            block_N = tile[1]
-            block_K = tile[2]
+        def generate_matmul(config: MatmulConfig, threads: int):
+            block_M = config.tile[0]
+            block_N = config.tile[1]
+            block_K = config.tile[2]
             M = config.M
             N = config.N
             K = config.K
             group_size = config.group_size
+            packed_weight_shape = (
+                (K, (N + 1) // 2) if config.layout == "nn" else (N, (K + 1) // 2)
+            )
 
-            # Reuse global/shared loads and INT4 decoding in every kernel variant.
             @T.macro
-            def load_tiles(A, B, tile_A, tile_W, bx, by, bz):
-                for i, k in T.Parallel(block_M, block_K):
-                    x_idx = bx * block_M + i
-                    k_idx = bz * block_K + k
-                    if x_idx < M and k_idx < K:
-                        tile_A[i, k] = A[x_idx, k_idx]
-                    else:
-                        tile_A[i, k] = 0.0
-
+            def load_nn_weight_tile(B, tile_W, by, bz):
+                # Physical B[K,ceil(N/2)]: each byte contains two N columns.
                 for k, j in T.Parallel(block_K, T.ceildiv(block_N, 2)):
                     k_idx = bz * block_K + k
                     # Start at the byte containing this tile's first column.
@@ -85,6 +79,51 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                             tile_W[k, high_col] = T.cast(high_signed, "float16")
                         else:
                             tile_W[k, high_col] = 0.0
+
+            @T.macro
+            def load_nt_weight_tile(B, tile_W, by, bz):
+                # Physical B[N,ceil(K/2)]: each byte contains two K positions.
+                for j, k in T.Parallel(block_N, T.ceildiv(block_K, 2)):
+                    y_idx = by * block_N + j
+                    packed_k = (bz * block_K) // 2 + k
+                    low_k = 2 * packed_k - bz * block_K
+                    high_k = low_k + 1
+                    packed_byte = T.alloc_local((1,), "int32")
+                    packed_byte[0] = 0
+                    if y_idx < N and packed_k < T.ceildiv(K, 2):
+                        packed_byte[0] = T.cast(B[y_idx, packed_k], "int32")
+
+                    low_code = packed_byte[0] & 0xF
+                    high_code = (packed_byte[0] >> 4) & 0xF
+                    low_signed = T.if_then_else(low_code >= 8, low_code - 16, low_code)
+                    high_signed = T.if_then_else(high_code >= 8, high_code - 16, high_code)
+
+                    # An odd block_K can split a byte between adjacent K tiles.
+                    if 0 <= low_k and low_k < block_K:
+                        if 2 * packed_k < K:
+                            tile_W[low_k, j] = T.cast(low_signed, "float16")
+                        else:
+                            tile_W[low_k, j] = 0.0
+                    if 0 <= high_k and high_k < block_K:
+                        if 2 * packed_k + 1 < K:
+                            tile_W[high_k, j] = T.cast(high_signed, "float16")
+                        else:
+                            tile_W[high_k, j] = 0.0
+
+            @T.macro
+            def load_tiles(A, B, tile_A, tile_W, bx, by, bz):
+                for i, k in T.Parallel(block_M, block_K):
+                    x_idx = bx * block_M + i
+                    k_idx = bz * block_K + k
+                    if x_idx < M and k_idx < K:
+                        tile_A[i, k] = A[x_idx, k_idx]
+                    else:
+                        tile_A[i, k] = 0.0
+                # Compile-time choice; shared tile_W stays [block_K,block_N].
+                if config.layout == "nn":
+                    load_nn_weight_tile(B, tile_W, by, bz)
+                else:
+                    load_nt_weight_tile(B, tile_W, by, bz)
 
             @T.macro
             def matmul_tile(A, B, tile_Out, bx, by):
@@ -122,7 +161,7 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                 @T.prim_func
                 def grouped_matmul_int4(
                     A: T.Tensor((M, K), dtype=config.A_dtype),
-                    B: T.Tensor((K, (N + 1) // 2), dtype="uint8"),
+                    B: T.Tensor(packed_weight_shape, dtype="uint8"),
                     C: T.Tensor((num_groups, N), dtype="float32"),
                     D: T.Tensor((M, N), dtype=config.out_dtype),
                 ):
@@ -189,7 +228,7 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
                 @T.prim_func
                 def scaled_matmul_int4(
                     A: T.Tensor((M, K), dtype=config.A_dtype),
-                    B: T.Tensor((K, (N + 1) // 2), dtype="uint8"),
+                    B: T.Tensor(packed_weight_shape, dtype="uint8"),
                     C: T.Tensor((N,), dtype="float32"),
                     D: T.Tensor((M, N), dtype=config.out_dtype),
                 ):
@@ -216,7 +255,7 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
             @T.prim_func
             def tiled_matmul_int4(
                 A: T.Tensor((M, K), dtype=config.A_dtype),
-                B: T.Tensor((K, (N + 1) // 2), dtype="uint8"),
+                B: T.Tensor(packed_weight_shape, dtype="uint8"),
                 C: T.Tensor((M, N), dtype=config.out_dtype),
             ):
                 with T.Kernel(
@@ -236,4 +275,4 @@ class WeightDequantMatmulScheduler(MatmulScheduler):
 
             return tiled_matmul_int4
 
-        return generate_matmul(self.config, self.tile, self.threads)
+        return generate_matmul(self.config, self.threads)

@@ -18,6 +18,7 @@ should be checked explicitly.
 - Reusable operators: `MatmulConfig → scheduler selection → kernel build → calls`.
 - Three execution paths: PyTorch CPU, PyTorch MPS, and TileLang-generated Metal.
 - FP16/FP32 activation and weight inputs, including mixed FP16/FP32 inputs.
+- `nt` (default) and `nn` weight layouts, including packed INT4 weights.
 - A16W4: FP16 activations with signed INT4 weights packed into `uint8` storage.
 - FP32 computation and accumulation with FP16 or FP32 output. Scaling is applied
   before the final output conversion.
@@ -72,12 +73,13 @@ config = MatmulConfig(
     W_dtype="float16",
     accum_dtype="float32",
     out_dtype="float16",
+    layout="nt",
     tile=(8, 8, 8),
 )
 op = Matmul(config, device="mps", backend="tilelang")
 
 A = torch.randn((config.M, config.K), dtype=torch.float16, device="mps")
-W = torch.randn((config.K, config.N), dtype=torch.float16, device="mps")
+W = torch.randn((config.N, config.K), dtype=torch.float16, device="mps")
 C = op(A, W)
 assert C.shape == (config.M, config.N) and C.dtype == torch.float16
 
@@ -88,6 +90,12 @@ assert op(A, W, out=out) is out
 
 `tile` is `(block_M, block_N, block_K)`. Operator construction selects and builds
 an implementation; calling the operator performs the computation without tuning.
+
+`layout="nt"` is the default: pass physical weights `[N,K]` to compute `A @ W.T`.
+Use `layout="nn"` with physical weights `[K,N]` to compute `A @ W`.
+Both paths load their weight format directly into a shared `[block_K,block_N]`
+tile; the Metal path does not transpose the full weight matrix on each call.
+Existing calls that pass `[K,N]` weights should explicitly set `layout="nn"`.
 
 ## Grouped A16W4 matmul
 
@@ -108,11 +116,13 @@ config = MatmulConfig(
     out_dtype="float16",
     with_scaling=True,
     group_size=32,
+    layout="nt",
     tile=(8, 8, 8),
 )
-W = torch.randn((config.K, config.N), dtype=torch.float16)
-qW, scales = quantize_int4_with_grouping(W, config.group_size)
-W_packed = pack_int4(qW).to("mps")
+# Quantizers always take logical [K,N], regardless of the matmul layout.
+W_logical = torch.randn((config.K, config.N), dtype=torch.float16)
+qW, scales = quantize_int4_with_grouping(W_logical, config.group_size)
+W_packed = pack_int4(qW.T.contiguous()).to("mps")  # nt: [N,ceil(K/2)]
 scales = scales.to("mps")
 A = torch.randn((config.M, config.K), dtype=torch.float16, device="mps")
 
@@ -126,14 +136,18 @@ assert C.shape == (config.M, config.N) and C.dtype == torch.float16
 | Value | Shape and type |
 | --- | --- |
 | Activations `A` | `[M, K]`, as specified by `A_dtype` |
-| Logical weights `W` | `[K, N]` |
-| Unpacked INT4 codes `qW` | `[K, N]`, `torch.int8` |
-| Packed INT4 weights | `[K, ceil(N / 2)]`, `torch.uint8` |
+| Logical weights / quantizer input | `[K, N]` |
+| Dense weights, `nn` | `[K, N]` |
+| Dense weights, `nt` (default) | `[N, K]` |
+| Quantizer output `qW` | `[K, N]`, `torch.int8` |
+| Packed INT4 weights, `nn` | `[K, ceil(N / 2)]`, `torch.uint8` |
+| Packed INT4 weights, `nt` | `[N, ceil(K / 2)]`, `torch.uint8` |
 | Per-column scales, `group_size=0` | `[N]`, `torch.float32` |
 | Grouped scales, `group_size>0` | `[ceil(K / group_size), N]`, `torch.float32` |
 | Output | `[M, N]`, FP16 or FP32 as configured |
 
-Packing runs along N: the first value occupies the low nibble and the second
+Packing runs along the physical last dimension: N for `nn`, K for `nt`.
+The first value occupies the low nibble and the second
 occupies the high nibble, using signed two's-complement codes in `[-8, 7]`.
 The quantizers currently generate symmetric codes in `[-7, 7]`, using scale
 `amax / 7` and nearest-even rounding. An all-zero column or group uses scale 1.
@@ -142,6 +156,9 @@ Use `quantize_int4(W)` for per-column scaling and
 `quantize_int4_with_grouping(W, group_size)` for positive K-group sizes.
 `group_size` belongs to the weight format and is independent of the execution
 tile. Configure it in `MatmulConfig`, then pass the corresponding scales to calls.
+The quantizers keep their logical `[K,N]` input and output convention. Pack `qW`
+for `nn`, or pack `qW.T.contiguous()` for `nt`, during weight preparation.
+Scales stay `[N]` or `[groups,N]` in both layouts; groups always follow logical K.
 With scaling disabled, omit `scales`.
 
 Move inputs and scales to the selected device before calling an operator.
@@ -172,7 +189,7 @@ python demo.py
 ```
 
 The tests use the standard-library `unittest` module. `smoke` covers small shapes,
-dtype combinations, quantization, packing, API checks, and precision regressions.
+dtype combinations, both layouts, quantization, packing, API checks, and precision regressions.
 `stress` checks larger matrices, including tails and K tiles crossing quantization
 groups. These are correctness tests, not performance benchmarks.
 

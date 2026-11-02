@@ -24,16 +24,17 @@ def on_device(device):
 def configs_for(shape, tile, group_size):
     """Dense types: raw only. INT4: raw, column-scaled, and group-scaled."""
     M, N, K = shape
-    for A_dtype, W_dtype, accum_dtype, out_dtype, _ in SUPPORTED_DTYPE_COMBINATIONS:
-        modes = ((False, 0),)
-        if W_dtype == "int4":
-            modes += ((True, 0), (True, group_size))
-        for with_scaling, group in modes:
-            yield MatmulConfig(
-                M, N, K, A_dtype=A_dtype, W_dtype=W_dtype,
-                accum_dtype=accum_dtype, out_dtype=out_dtype, tile=tile,
-                with_scaling=with_scaling, group_size=group,
-            )
+    for layout in ("nn", "nt"):
+        for A_dtype, W_dtype, accum_dtype, out_dtype, _ in SUPPORTED_DTYPE_COMBINATIONS:
+            modes = ((False, 0),)
+            if W_dtype == "int4":
+                modes += ((True, 0), (True, group_size))
+            for with_scaling, group in modes:
+                yield MatmulConfig(
+                    M, N, K, A_dtype=A_dtype, W_dtype=W_dtype,
+                    accum_dtype=accum_dtype, out_dtype=out_dtype, tile=tile,
+                    with_scaling=with_scaling, group_size=group, layout=layout,
+                )
 
 
 def config_label(config):
@@ -41,6 +42,7 @@ def config_label(config):
         "dtypes": (config.A_dtype, config.W_dtype, config.accum_dtype, config.out_dtype),
         "shape": (config.M, config.N, config.K),
         "tile": config.tile,
+        "layout": config.layout,
         "scaling": config.with_scaling,
         "group_size": config.group_size,
     }
@@ -72,7 +74,8 @@ def check_matmul(test, config, device, backend, *, noncontiguous=False, reuse=Fa
                 qW, scales_cpu = quantize_int4(W_float)
         else:
             qW = torch.randint(-8, 8, (config.K, config.N), generator=generator, dtype=torch.int8)
-        W_cpu = pack_int4(qW)
+        stored_codes = qW if config.layout == "nn" else qW.T.contiguous()
+        W_cpu = pack_int4(stored_codes)
         W_reference = qW.double()  # Deliberately do not use unpack_int4 as the oracle.
         if scales_cpu is not None:
             if config.group_size:
@@ -85,6 +88,8 @@ def check_matmul(test, config, device, backend, *, noncontiguous=False, reuse=Fa
             getattr(torch, config.W_dtype)
         )
         W_reference = W_cpu.double()
+        if config.layout == "nt":
+            W_cpu = W_cpu.T.contiguous()
 
     reference = (A_cpu.double() @ W_reference).to(getattr(torch, config.out_dtype))
     A, W = A_cpu.to(device), W_cpu.to(device)

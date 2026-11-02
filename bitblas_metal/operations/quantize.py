@@ -10,6 +10,8 @@ def quantize_int4(W: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     Returns unpacked int8 codes qW[K, N] in [-7, 7] and float32 scales[N],
     both on W.device. Reconstruct weights with qW.float() * scales.
     FP32 arithmetic and round-to-nearest, ties-to-even are used throughout.
+    W always uses logical [K,N], independently of MatmulConfig.layout.
+    For nt matmul, pack qW.T so its physical storage is [N,ceil(K/2)].
     All-zero columns use scale 1. A nonzero scale must be representable
     as a positive FP32 value. Gradients are not tracked during preparation.
     """
@@ -55,6 +57,8 @@ def quantize_int4_with_grouping(
     and float32 scales[ceil(K / group_size), N] on W.device. The last group
     is zero-padded for reduction; padded rows are removed from qW.
     All-zero group/column slices use scale 1. Rounding is nearest-even.
+    Input and qW always use logical [K,N]. For nt matmul, pack qW.T;
+    scales remain [groups,N] and grouping still follows logical K.
     """
     if not isinstance(W, torch.Tensor):
         raise TypeError(f"W must be a torch.Tensor; got {type(W).__name__}.")

@@ -7,6 +7,12 @@ from bitblas_metal.operations.config import SUPPORTED_DTYPE_COMBINATIONS
 
 
 class TestMatmulConfig(unittest.TestCase):
+    def test_layout_defaults_to_nt(self):
+        self.assertEqual(MatmulConfig(2, 3, 4).layout, "nt")
+        for layout in ("nn", "nt"):
+            with self.subTest(layout=layout):
+                self.assertEqual(MatmulConfig(2, 3, 4, layout=layout).layout, layout)
+
     def test_supported_combinations_and_scaling_policy(self):
         for A, W, accum, out, dequant in SUPPORTED_DTYPE_COMBINATIONS:
             with self.subTest(dtypes=(A, W, accum, out)):
@@ -35,6 +41,9 @@ class TestMatmulConfig(unittest.TestCase):
             ({"group_size": -1}, ValueError), ({"group_size": True}, TypeError),
             ({"group_size": 1.5}, TypeError), ({"with_scaling": 1}, TypeError),
             ({"A_dtype": "int8"}, NotImplementedError), ({"A_dtype": 16}, TypeError),
+            ({"layout": "tn"}, ValueError), ({"layout": "tt"}, ValueError),
+            ({"layout": "NT"}, ValueError), ({"layout": ""}, ValueError),
+            ({"layout": None}, TypeError), ({"layout": ["nn"]}, TypeError),
         )
         for changes, error in cases:
             with self.subTest(changes=changes):

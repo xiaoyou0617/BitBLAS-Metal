@@ -16,15 +16,19 @@ class TorchCPUMatmulScheduler(MatmulScheduler):
     def build(self) -> MatmulKernel:
         compute_dtype = getattr(torch, self.config.accum_dtype)
 
+        def logical_weight(W):
+            if self.config.requires_dequant:
+                cols = self.config.N if self.config.layout == "nn" else self.config.K
+                W = unpack_int4(W, original_cols=cols)
+            return W if self.config.layout == "nn" else W.T
+
         def output_accumulator(out):
             # FP16 output must not round intermediate sums or unscaled results.
             return out if out.dtype == compute_dtype else torch.empty_like(out, dtype=compute_dtype)
 
         def matmul(A: torch.Tensor, W: torch.Tensor, out: torch.Tensor):
-            if self.config.requires_dequant:
-                W = unpack_int4(W, original_cols=self.config.N)
             A_compute = A.to(dtype=compute_dtype)
-            W_compute = W.to(dtype=compute_dtype)
+            W_compute = logical_weight(W).to(dtype=compute_dtype)
             accumulator = output_accumulator(out)
             torch.mm(A_compute, W_compute, out=accumulator)
             if accumulator is not out:
@@ -33,7 +37,7 @@ class TorchCPUMatmulScheduler(MatmulScheduler):
 
         if self.config.with_scaling and self.config.group_size > 0:
             def grouped_matmul(A, W, scales, out):
-                W_compute = unpack_int4(W, original_cols=self.config.N).to(compute_dtype)
+                W_compute = logical_weight(W).to(compute_dtype)
                 group_indices = (
                     torch.arange(self.config.K, device=W.device) // self.config.group_size
                 )

@@ -9,8 +9,6 @@ class TiledMatmulScheduler(MatmulScheduler):
 
     def __init__(self, config: MatmulConfig):
         super().__init__(config)
-        # Keep the existing tile until measured selection rules are introduced.
-        self.tile = config.tile
         self.threads = 64
 
     def build(self) -> MatmulKernel:
@@ -23,19 +21,19 @@ class TiledMatmulScheduler(MatmulScheduler):
             execution_backend="torch",
             out_idx=[2]
         )
-        def generate_matmul(config: MatmulConfig, tile: tuple, threads: int):
+        def generate_matmul(config: MatmulConfig, threads: int):
+            weight_shape = (config.K, config.N) if config.layout == "nn" else (config.N, config.K)
 
             # Keep A/B/C device-buffer order for the current positional Metal adapter.
             @T.prim_func
             def tiled_matmul(
                 A: T.Tensor((config.M, config.K), dtype=config.A_dtype),
-                B: T.Tensor((config.K, config.N), dtype=config.W_dtype),
+                B: T.Tensor(weight_shape, dtype=config.W_dtype),
                 C: T.Tensor((config.M, config.N), dtype=config.out_dtype)
             ):
-                assert len(tile) == 3
-                block_M = tile[0]
-                block_N = tile[1]
-                block_K = tile[2]
+                block_M = config.tile[0]
+                block_N = config.tile[1]
+                block_K = config.tile[2]
                 M = config.M
                 N = config.N
                 K = config.K
@@ -63,13 +61,23 @@ class TiledMatmulScheduler(MatmulScheduler):
                             else:
                                 tile_A[i, k] = 0.0
 
-                        for k, j in T.Parallel(block_K, block_N):
-                            y_idx = j + by * block_N
-                            k_idx = k + bz * block_K
-                            if y_idx < N and k_idx < K:
-                                tile_W[k, j] = B[k_idx, y_idx]
-                            else:
-                                tile_W[k, j] = 0.0
+                        if config.layout == "nn":
+                            for k, j in T.Parallel(block_K, block_N):
+                                y_idx = j + by * block_N
+                                k_idx = k + bz * block_K
+                                if y_idx < N and k_idx < K:
+                                    tile_W[k, j] = B[k_idx, y_idx]
+                                else:
+                                    tile_W[k, j] = 0.0
+                        else:
+                            # Read physical W[N,K] along K; shared storage stays [BK,BN].
+                            for j, k in T.Parallel(block_N, block_K):
+                                y_idx = j + by * block_N
+                                k_idx = k + bz * block_K
+                                if y_idx < N and k_idx < K:
+                                    tile_W[k, j] = B[y_idx, k_idx]
+                                else:
+                                    tile_W[k, j] = 0.0
 
                         T.sync_threads()
 
@@ -94,4 +102,4 @@ class TiledMatmulScheduler(MatmulScheduler):
 
             return tiled_matmul
 
-        return generate_matmul(self.config, self.tile, self.threads)
+        return generate_matmul(self.config, self.threads)

@@ -8,6 +8,7 @@ def pack_int4(W: torch.Tensor) -> torch.Tensor:
     the first value occupies the low four bits, the second the high four.
     An odd final column is padded with zero in the high four bits.
     The output has shape (rows, ceil(cols / 2)) and stays on W.device.
+    This helper is layout-agnostic: nn weights pack N; nt weights pack K.
     Batched Torch operations run on the input device. Range validation
     reads one boolean on the host, synchronizing once for MPS inputs.
     """
